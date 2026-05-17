@@ -21,8 +21,7 @@ use walkdir::WalkDir;
 use serde::Deserialize;
 
 const MASTER_DIR: &str = "..";
-
-// ── GITHUB TYPES ─────────────────────────────────────────────
+const DEFAULT_GPG_KEY: &str = "417CAB41FAB91318";
 
 #[derive(Clone, Default)]
 struct GitHubStats {
@@ -78,13 +77,18 @@ fn fetch_github_stats(remote_url: &str) -> Option<GitHubStats> {
     None
 }
 
-// ── PROJECT TYPES ─────────────────────────────────────────────
-
 #[derive(Clone)]
 enum FileStatusType {
     Modified,
     Untracked,
     Deleted,
+}
+
+#[derive(Clone)]
+struct GpgStatus {
+    is_configured: bool,
+    signing_key: Option<String>,
+    auto_retrieve: bool,
 }
 
 struct Project {
@@ -101,14 +105,28 @@ struct Project {
     last_commit_msg: Option<String>,
     last_commit_time: i64,
     github_stats: Option<GitHubStats>,
+    gpg_status: GpgStatus,
+    remote_status: Option<bool>,
 }
 
 enum InputMode {
     Normal,
     CreatingProject,
+    ConfigGpgKey,
+    ConfirmAction,
 }
 
-// ── APP STATE ─────────────────────────────────────────────────
+enum ActionMode {
+    None,
+    ConfigureGpg,
+    TestRemotes,
+}
+
+struct ConfirmData {
+    action: ActionMode,
+    message: String,
+    projects: Vec<String>,
+}
 
 struct App {
     projects: Vec<Project>,
@@ -119,6 +137,10 @@ struct App {
     rx: Option<mpsc::Receiver<Vec<Project>>>,
     tick: u8,
     theme: Theme,
+    action_mode: ActionMode,
+    confirm_data: Option<ConfirmData>,
+    global_gpg_key: String,
+    status_message: Option<String>,
 }
 
 impl App {
@@ -132,6 +154,10 @@ impl App {
             rx: None,
             tick: 0,
             theme: Theme::from_brand(brand),
+            action_mode: ActionMode::None,
+            confirm_data: None,
+            global_gpg_key: DEFAULT_GPG_KEY.to_string(),
+            status_message: None,
         };
         app.scan_projects();
         app
@@ -144,6 +170,7 @@ impl App {
         self.is_loading = true;
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
+        let gpg_key = self.global_gpg_key.clone();
 
         thread::spawn(move || {
             let mut found_projects = Vec::new();
@@ -252,11 +279,17 @@ impl App {
                             let is_dirty = (untracked + modified + deleted) > 0;
 
                             let mut github_stats = None;
-                            if let Ok(remote) = repo.find_remote("origin") {
+                            let mut remote_status = None;
+                            if let Ok(mut remote) = repo.find_remote("origin") {
                                 if let Some(url) = remote.url() {
                                     github_stats = fetch_github_stats(url);
+                                    if let Ok(_) = remote.connect(git2::Direction::Fetch) {
+                                        remote_status = Some(true);
+                                    }
                                 }
                             }
+
+                            let gpg_status = check_gpg_status(&git_dir, &gpg_key);
 
                             found_projects.push(Project {
                                 name,
@@ -273,6 +306,8 @@ impl App {
                                 last_commit_msg,
                                 last_commit_time,
                                 github_stats,
+                                gpg_status,
+                                remote_status,
                             });
                         }
                     }
@@ -323,9 +358,71 @@ impl App {
             self.list_state.select(Some(index));
         }
     }
+
+    fn configure_gpg_all(&mut self, key: &str) {
+        let key_owned = key.to_string();
+
+        thread::spawn(move || {
+            let walker = WalkDir::new(MASTER_DIR)
+                .min_depth(1)
+                .max_depth(2)
+                .into_iter();
+
+            for entry in walker.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() && path.join(".git").exists() {
+                    if let Ok(repo) = Repository::open(path) {
+                        let _ = repo.config().and_then(|mut cfg| {
+                            cfg.set_i32("commit.gpgsign", 1)?;
+                            cfg.set_str("user.signingkey", &key_owned)?;
+                            cfg.set_str("gpg.program", "gpg")?;
+                            cfg.set_i32("gpg.autoKeyRetrieve", 1)?;
+                            Ok(())
+                        });
+                    }
+                }
+            }
+        });
+
+        self.status_message = Some(format!("Configuring GPG key {} on all repos...", key));
+        self.scan_projects();
+    }
+
+    fn test_remotes(&mut self) {
+        self.status_message = Some("Testing remote connections...".to_string());
+        self.scan_projects();
+    }
 }
 
-// ── UTILS ─────────────────────────────────────────────────────
+fn check_gpg_status(git_dir: &PathBuf, expected_key: &str) -> GpgStatus {
+    let config_path = git_dir.join("config");
+    if !config_path.exists() {
+        return GpgStatus {
+            is_configured: false,
+            signing_key: None,
+            auto_retrieve: false,
+        };
+    }
+
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        let has_signing_key = content.contains(&format!("signingkey = {}", expected_key));
+        let has_gpgsign = content.contains("gpgsign = 1");
+        let has_auto_retrieve = content.contains("autoKeyRetrieve = true") 
+            || content.contains("autoKeyRetrieve = 1");
+
+        return GpgStatus {
+            is_configured: has_signing_key && has_gpgsign,
+            signing_key: if has_signing_key { Some(expected_key.to_string()) } else { None },
+            auto_retrieve: has_auto_retrieve,
+        };
+    }
+
+    GpgStatus {
+        is_configured: false,
+        signing_key: None,
+        auto_retrieve: false,
+    }
+}
 
 fn format_time_ago(timestamp: i64) -> String {
     if timestamp == 0 {
@@ -350,8 +447,6 @@ fn format_time_ago(timestamp: i64) -> String {
         format!("{} yr ago", diff / 31536000)
     }
 }
-
-// ── ENTRY POINT ───────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
     let brand = match std::env::var("TROPICAL_BRAND").as_deref() {
@@ -387,8 +482,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// ── EVENT LOOP ────────────────────────────────────────────────
-
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(), Box<dyn Error>>
 where
     B::Error: 'static,
@@ -421,6 +514,13 @@ where
                                     app.input_mode = InputMode::CreatingProject;
                                     app.input_buffer.clear();
                                 }
+                                KeyCode::Char('g') => {
+                                    app.input_mode = InputMode::ConfigGpgKey;
+                                    app.input_buffer = app.global_gpg_key.clone();
+                                }
+                                KeyCode::Char('t') => {
+                                    app.test_remotes();
+                                }
                                 _ => {}
                             },
                             InputMode::CreatingProject => match key.code {
@@ -451,6 +551,45 @@ where
                                 KeyCode::Esc => app.input_mode = InputMode::Normal,
                                 _ => {}
                             },
+                            InputMode::ConfigGpgKey => match key.code {
+                                KeyCode::Enter => {
+                                    let key = app.input_buffer.trim().to_string();
+                                    if !key.is_empty() {
+                                        app.global_gpg_key = key.clone();
+                                        app.configure_gpg_all(&key);
+                                    }
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Char(c) => app.input_buffer.push(c),
+                                KeyCode::Backspace => {
+                                    app.input_buffer.pop();
+                                }
+                                KeyCode::Esc => app.input_mode = InputMode::Normal,
+                                _ => {}
+                            },
+                            InputMode::ConfirmAction => match key.code {
+                                KeyCode::Char('y') | KeyCode::Enter => {
+                                    if let Some(confirm) = &app.confirm_data {
+                                        let gpg_key = app.global_gpg_key.clone();
+                                        match confirm.action {
+                                            ActionMode::ConfigureGpg => {
+                                                app.configure_gpg_all(&gpg_key);
+                                            }
+                                            ActionMode::TestRemotes => {
+                                                app.test_remotes();
+                                            }
+                                            ActionMode::None => {}
+                                        }
+                                    }
+                                    app.confirm_data = None;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => {
+                                    app.confirm_data = None;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                _ => {}
+                            },
                         }
                     }
                 }
@@ -469,7 +608,6 @@ where
                         if let InputMode::Normal = app.input_mode {
                             let y = m.row as usize;
                             if y > 1 {
-                                // skip status bar (row 0) + border (row 1)
                                 app.select_index(app.list_state.offset() + (y - 2));
                             }
                         }
@@ -484,47 +622,50 @@ where
     }
 }
 
-// ── UI RENDER ─────────────────────────────────────────────────
-
 fn ui(f: &mut Frame, app: &mut App) {
     let t = &app.theme;
     let area = f.area();
 
-    // ── LAYOUT: status_bar(1) | main ──────────────────────────
-    // Archetype A: Command Station (§6 TUI spec)
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
 
-    // ── STATUS BAR ────────────────────────────────────────────
-    // TUI_STATUS_BAR dense — [ LABEL: VALUE ] bracket notation
-    // Left: app identity + mode + repo count
-    // Right: key hint shortcuts
     let repo_count = format!("{} REPOS", app.projects.len());
+    let gpg_key_short = if app.global_gpg_key.len() > 8 {
+        &app.global_gpg_key[app.global_gpg_key.len() - 8..]
+    } else {
+        &app.global_gpg_key
+    };
+    
     let status_line = if app.is_loading {
         let spinner = t.spinner_span(app.tick);
         let mut spans = t.status_seg("MODE", "SCANNING");
         spans.insert(2, spinner);
         Line::from(spans)
     } else {
-        t.status_bar_line(
-            vec![("TROPICAL_PM", "v0.1"), ("REPOS", &repo_count)],
-            vec![("R", "REFRESH"), ("C", "CREATE"), ("Q", "QUIT")],
-        )
+        let left = vec![
+            ("TROPICAL_PM", "v0.2"),
+            ("REPOS", &repo_count),
+            ("GPG", gpg_key_short),
+        ];
+        let right = vec![
+            ("R", "REFRESH"),
+            ("G", "GPG KEY"),
+            ("T", "TEST REMOTE"),
+            ("C", "CREATE"),
+            ("Q", "QUIT"),
+        ];
+        t.status_bar_line(left, right)
     };
 
     f.render_widget(Paragraph::new(status_line), root[0]);
 
-    // ── MAIN AREA: list(35%) | detail(65%) ────────────────────
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(root[1]);
 
-    // ── PROJECT LIST — Nav Orbit style ────────────────────────
-    // Active item: ❯ NAME (primary, bold)
-    // Inactive:    ○/● + NAME (tertiary, dimmed)
     let items: Vec<ListItem> = app
         .projects
         .iter()
@@ -550,12 +691,28 @@ fn ui(f: &mut Frame, app: &mut App) {
                 ""
             };
 
+            let gpg_indicator = if p.gpg_status.is_configured {
+                Span::styled(" ✓", t.success())
+            } else if p.gpg_status.signing_key.is_some() {
+                Span::styled(" ⚠", t.warning())
+            } else {
+                Span::styled(" ○", t.text_disabled())
+            };
+
+            let remote_indicator = match p.remote_status {
+                Some(true) => Span::styled(" ●", t.success()),
+                Some(false) => Span::styled(" ◌", t.danger()),
+                None => Span::styled(" -", t.text_disabled()),
+            };
+
             let line = Line::from(vec![
                 prefix,
                 dot,
                 Span::raw(" "),
                 Span::styled(&p.name, name_style),
                 Span::styled(sync_sym, t.accent_light()),
+                gpg_indicator,
+                remote_indicator,
             ]);
             ListItem::new(line)
         })
@@ -572,10 +729,8 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_stateful_widget(list, main[0], &mut app.list_state);
 
-    // ── DETAIL PANEL ──────────────────────────────────────────
     let right = main[1];
 
-    // Creation mode — prompt with animated cursor
     if let InputMode::CreatingProject = app.input_mode {
         let cursor = t.cursor_span(app.tick);
         let mut prompt_spans = vec![
@@ -597,7 +752,36 @@ fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // No project selected
+    if let InputMode::ConfigGpgKey = app.input_mode {
+        let cursor = t.cursor_span(app.tick);
+        let mut prompt_spans = vec![
+            Span::styled("  GPG SIGNING KEY  ❯  ", t.accent()),
+            Span::styled(&app.input_buffer, t.text()),
+        ];
+        prompt_spans.push(cursor);
+
+        let input_para = Paragraph::new(Line::from(prompt_spans)).block(
+            Block::default()
+                .title(Span::styled(
+                    " [ ENTER ] APPLY TO ALL  [ ESC ] CANCEL ",
+                    t.input_prompt(),
+                ))
+                .borders(Borders::ALL)
+                .border_style(t.border_active()),
+        );
+        f.render_widget(input_para, right);
+        
+        if let Some(msg) = &app.status_message {
+            let hint = Paragraph::new(Span::styled(msg, t.text_dim())).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(t.border())
+            );
+            f.render_widget(hint, Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3)]).split(root[1])[1]);
+        }
+        return;
+    }
+
     let Some(idx) = app.list_state.selected() else {
         let msg = if app.is_loading {
             "  Scanning repositories…"
@@ -620,22 +804,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         return;
     };
 
-    // ── DETAIL CONTENT ────────────────────────────────────────
     let mut lines: Vec<Line> = Vec::new();
 
-    // Panel header — [ PROJECT_NAME ] strip
     let project_title = p.name.to_uppercase();
     lines.push(t.panel_header_line(&project_title));
     lines.push(Line::from(""));
 
-    // Path — tree style
     lines.push(Line::from(vec![
         Span::styled(TREE_BRANCH, t.text_muted()),
         Span::styled("PATH    ", t.label()),
         Span::styled(p.path.to_string_lossy().to_string(), t.text_muted()),
     ]));
 
-    // Branch + sync
     let mut branch_spans = vec![
         Span::styled(TREE_BRANCH, t.text_muted()),
         Span::styled("BRANCH  ", t.label()),
@@ -660,7 +840,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     lines.push(Line::from(branch_spans));
 
-    // Status
     let mut status_spans = vec![
         Span::styled(TREE_LAST, t.text_muted()),
         Span::styled("STATUS  ", t.label()),
@@ -690,7 +869,56 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     lines.push(Line::from(""));
 
-    // Last commit
+    lines.push(t.panel_header_line("GPG SIGNING"));
+    let gpg_line = if p.gpg_status.is_configured {
+        vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("✓ CONFIGURED", t.success().add_modifier(Modifier::BOLD)),
+            Span::styled("  ", t.text_muted()),
+            Span::styled(p.gpg_status.signing_key.as_deref().unwrap_or(""), t.text_dim()),
+        ]
+    } else if p.gpg_status.signing_key.is_some() {
+        vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("⚠ PARTIAL", t.warning().add_modifier(Modifier::BOLD)),
+            Span::styled("  (gpgsign not enabled)", t.text_disabled()),
+        ]
+    } else {
+        vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("○ NOT CONFIGURED", t.text_disabled()),
+        ]
+    };
+    lines.push(Line::from(gpg_line));
+
+    if p.gpg_status.auto_retrieve {
+        lines.push(Line::from(vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("✓ autoKeyRetrieve enabled", t.text_dim()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    lines.push(t.panel_header_line("REMOTE CONNECTION"));
+    let remote_line = match p.remote_status {
+        Some(true) => vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("● CONNECTED", t.success().add_modifier(Modifier::BOLD)),
+        ],
+        Some(false) => vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("◌ FAILED", t.danger().add_modifier(Modifier::BOLD)),
+        ],
+        None => vec![
+            Span::styled("  ", t.text_muted()),
+            Span::styled("- NO REMOTE", t.text_disabled()),
+        ],
+    };
+    lines.push(Line::from(remote_line));
+
+    lines.push(Line::from(""));
+
     lines.push(t.panel_header_line("LAST COMMIT"));
     lines.push(Line::from(vec![
         Span::styled("  ", t.text_muted()),
@@ -704,7 +932,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         t.commit_msg(),
     )));
 
-    // GitHub stats
     if let Some(gh) = &p.github_stats {
         lines.push(Line::from(""));
         lines.push(t.panel_header_line("GITHUB"));
@@ -725,7 +952,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         ]));
     }
 
-    // Changed files — tree view
     if p.is_dirty {
         lines.push(Line::from(""));
         lines.push(t.panel_header_line("CHANGES"));
